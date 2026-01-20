@@ -277,4 +277,4 @@ saml-perf test  --issuer saml-idp     --sp-url http://localhost:4503/content/win
 
 ## License
 
-MIT License
+Apache 2.0 License
