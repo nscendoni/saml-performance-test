@@ -152,97 +152,88 @@ class SAMLPerformanceTester:
 
     async def _send_assertion(
         self,
-        session: aiohttp.ClientSession,
+        session_pool: asyncio.Queue,
         user: TestUser,
-        semaphore: asyncio.Semaphore,
     ) -> RequestResult:
         """
-        Send a single SAML assertion
+        Send a single SAML assertion.
+        Acquires a session from the pool and returns it (with cleared cookies) when done.
 
         Args:
-            session: aiohttp session
+            session_pool: pool of reusable ClientSessions (size == concurrency)
             user: TestUser to create assertion for
-            semaphore: Semaphore for concurrency control
 
         Returns:
             RequestResult with timing and status info
         """
-        async with semaphore:
-            start_time = time.perf_counter()
+        session = await session_pool.get()
+        start_time = time.perf_counter()
 
-            try:
-                # Build the signed SAML response
-                saml_response = self.saml_builder.build_signed_response(
-                    user_id=user.user_id,
-                    user_email=user.email,
-                    groups=user.groups,
-                    custom_attributes=user.custom_attributes,
-                )
+        try:
+            saml_response = self.saml_builder.build_signed_response(
+                user_id=user.user_id,
+                user_email=user.email,
+                groups=user.groups,
+                custom_attributes=user.custom_attributes,
+            )
 
-                # Prepare the POST data (standard SAML POST binding)
-                data = {
-                    "SAMLResponse": saml_response,
-                }
+            data = {"SAMLResponse": saml_response}
 
-                # Add RelayState if needed
-                if user.custom_attributes.get("relay_state"):
-                    data["RelayState"] = user.custom_attributes["relay_state"]
+            if user.custom_attributes.get("relay_state"):
+                data["RelayState"] = user.custom_attributes["relay_state"]
 
-                async with session.post(
-                    self.sp_url,
-                    data=data,
-                    allow_redirects=False,
-                ) as response:
-                    end_time = time.perf_counter()
-                    response_time_ms = (end_time - start_time) * 1000
-
-                    response_body = await response.text()
-
-                    # Consider 2xx and 3xx as success (redirects are common in SAML)
-                    success = 200 <= response.status < 400
-
-                    # Capture headers in debug mode
-                    response_headers = None
-                    if self.debug:
-                        response_headers = dict(response.headers)
-
-                    # In debug mode, capture full response body; otherwise truncate
-                    body_to_store = response_body if self.debug else (response_body[:500] if response_body else None)
-
-                    return RequestResult(
-                        user_id=user.user_id,
-                        success=success,
-                        status_code=response.status,
-                        response_time_ms=response_time_ms,
-                        response_body=body_to_store,
-                        error_message=None if success else f"HTTP {response.status}",
-                        response_headers=response_headers,
-                    )
-
-            except asyncio.TimeoutError:
+            async with session.post(
+                self.sp_url,
+                data=data,
+                allow_redirects=False,
+            ) as response:
                 end_time = time.perf_counter()
+                response_time_ms = (end_time - start_time) * 1000
+
+                response_body = await response.text()
+
+                success = 200 <= response.status < 400
+
+                response_headers = dict(response.headers) if self.debug else None
+                body_to_store = response_body if self.debug else (response_body[:500] if response_body else None)
+
                 return RequestResult(
                     user_id=user.user_id,
-                    success=False,
-                    response_time_ms=(end_time - start_time) * 1000,
-                    error_message="Request timeout",
+                    success=success,
+                    status_code=response.status,
+                    response_time_ms=response_time_ms,
+                    response_body=body_to_store,
+                    error_message=None if success else f"HTTP {response.status}",
+                    response_headers=response_headers,
                 )
-            except aiohttp.ClientError as e:
-                end_time = time.perf_counter()
-                return RequestResult(
-                    user_id=user.user_id,
-                    success=False,
-                    response_time_ms=(end_time - start_time) * 1000,
-                    error_message=f"Client error: {str(e)}",
-                )
-            except Exception as e:
-                end_time = time.perf_counter()
-                return RequestResult(
-                    user_id=user.user_id,
-                    success=False,
-                    response_time_ms=(end_time - start_time) * 1000,
-                    error_message=f"Unexpected error: {str(e)}",
-                )
+
+        except asyncio.TimeoutError:
+            end_time = time.perf_counter()
+            return RequestResult(
+                user_id=user.user_id,
+                success=False,
+                response_time_ms=(end_time - start_time) * 1000,
+                error_message="Request timeout",
+            )
+        except aiohttp.ClientError as e:
+            end_time = time.perf_counter()
+            return RequestResult(
+                user_id=user.user_id,
+                success=False,
+                response_time_ms=(end_time - start_time) * 1000,
+                error_message=f"Client error: {str(e)}",
+            )
+        except Exception as e:
+            end_time = time.perf_counter()
+            return RequestResult(
+                user_id=user.user_id,
+                success=False,
+                response_time_ms=(end_time - start_time) * 1000,
+                error_message=f"Unexpected error: {str(e)}",
+            )
+        finally:
+            session.cookie_jar.clear()
+            await session_pool.put(session)
 
     async def run_test(
         self,
@@ -262,8 +253,6 @@ class SAMLPerformanceTester:
             TestResults with aggregated statistics
         """
         results = TestResults()
-        semaphore = asyncio.Semaphore(concurrency)
-
         ssl_context = None if self.verify_ssl else False
 
         connector = aiohttp.TCPConnector(
@@ -271,14 +260,40 @@ class SAMLPerformanceTester:
             ssl=ssl_context,
         )
 
+        # Fixed pool of `concurrency` sessions — reused across all users
+        sessions = [
+            aiohttp.ClientSession(
+                timeout=self.timeout,
+                connector=connector,
+                connector_owner=False,
+            )
+            for _ in range(concurrency)
+        ]
+
+        _AFFINITY_NAMES = {"affinity", "awsalb", "awsalbcors", "jsessionid"}
+
+        async def _warmup(session: aiohttp.ClientSession) -> None:
+            async with session.get(self.sp_url, allow_redirects=True):
+                pass
+
+        await asyncio.gather(*(_warmup(s) for s in sessions))
+
+        for i, session in enumerate(sessions):
+            affinity = next(
+                (f"{m.key}={m.value}" for m in session.cookie_jar if m.key.lower() in _AFFINITY_NAMES),
+                "none",
+            )
+            print(f"[connection {i + 1:>4}] affinity={affinity}")
+
+        session_pool: asyncio.Queue = asyncio.Queue()
+        for session in sessions:
+            await session_pool.put(session)
+
         start_time = time.perf_counter()
 
-        async with aiohttp.ClientSession(
-            timeout=self.timeout,
-            connector=connector,
-        ) as session:
+        try:
             tasks = [
-                self._send_assertion(session, user, semaphore)
+                self._send_assertion(session_pool, user)
                 for user in users
             ]
 
@@ -290,6 +305,10 @@ class SAMLPerformanceTester:
 
                 if progress_callback:
                     progress_callback(completed, len(users))
+        finally:
+            for session in sessions:
+                await session.close()
+            await connector.close()
 
         end_time = time.perf_counter()
         results.total_time_seconds = end_time - start_time
@@ -379,8 +398,8 @@ async def run_performance_test(
 
     # Progress callback
     def progress(completed, total):
-        if verbose:
-            print(f"\rProgress: {completed}/{total} ({completed/total*100:.1f}%)", end="", flush=True)
+        if verbose and completed % 1000 == 0:
+            print(f"Progress: {completed}/{total} ({completed/total*100:.1f}%)", flush=True)
 
     # Run the test
     results = await tester.run_test(
